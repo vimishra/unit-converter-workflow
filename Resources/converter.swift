@@ -41,11 +41,13 @@ struct MeasureInfo {
   let names: [String]
   let symbol: String
   let unit: Dimension
+  let caseInsensitive: Bool
 
-  init(names: [String], unit: Dimension, imperial: Bool = false) {
+  init(names: [String], unit: Dimension, imperial: Bool = false, caseInsensitive: Bool = false) {
     self.names = names
     self.symbol = imperial ? "imperial \(unit.symbol)" : unit.symbol
     self.unit = unit
+    self.caseInsensitive = caseInsensitive
   }
 }
 
@@ -55,17 +57,30 @@ extension MeasureInfo {
     case none, partial, exact
   }
 
+  // Unit names are stored lowercased, but currency names come from the system
+  // already cased, where capitalizing would mangle acronyms such as “US Dollar”
+  var displayName: String {
+    guard let name = self.names.first else { return self.symbol }
+    return self.unit is UnitCurrency ? name : name.capitalized
+  }
+
   func matches(_ searchTerm: String) -> MatchType {
+    // Currency codes match regardless of case, unlike unit symbols where case is
+    // meaningful (Ml for megaliters versus ml for milliliters)
+    let searchTerm = self.caseInsensitive ? searchTerm.lowercased() : searchTerm
+    let symbol = self.caseInsensitive ? self.symbol.lowercased() : self.symbol
+    let names = self.caseInsensitive ? self.names.map { $0.lowercased() } : self.names
+
     // Check for symbol matches
-    let matchSymbol = self.symbol.hasPrefix(searchTerm)
+    let matchSymbol = symbol.hasPrefix(searchTerm)
 
     if matchSymbol {
-      if self.symbol == searchTerm { return .exact }
+      if symbol == searchTerm { return .exact }
       return .partial
     }
 
     // Check for name matches
-    let matchNames = self.names.filter { $0.hasPrefix(searchTerm) }
+    let matchNames = names.filter { $0.hasPrefix(searchTerm) }
 
     if matchNames.count > 0 {
       if (matchNames.contains { $0 == searchTerm }) { return .exact }
@@ -95,7 +110,28 @@ extension MeasureInfo {
     return formatter.string(from: number as NSNumber) ?? String(number)
   }
 
+  // Money reads better with cents than with the rounding used for everything else
+  private static func currencyToString(_ number: Double, forceSimple: Bool) -> String {
+    guard !(scientificNotation && !forceSimple) else { return MeasureInfo.numberToString(number, forceSimple: forceSimple) }
+
+    // Two decimals for everyday amounts, more for those which would round to nothing
+    let magnitude = abs(number)
+    let fractionDigits = MeasureInfo.decimalPlaces < 2 ? MeasureInfo.decimalPlaces : (magnitude > 0 && magnitude < 0.01 ? 6 : 2)
+
+    let formatter: NumberFormatter = NumberFormatter()
+
+    formatter.minimumFractionDigits = forceSimple ? 0 : fractionDigits
+    formatter.maximumFractionDigits = fractionDigits
+    formatter.numberStyle = .decimal
+    formatter.hasThousandSeparators = MeasureInfo.groupThousands && !forceSimple
+
+    return formatter.string(from: number as NSNumber) ?? String(number)
+  }
+
   func formatted(value: Double, forceSimple allowedNotation: Bool = false) -> String {
+    // Currencies have their own rounding rules
+    if self.unit is UnitCurrency { return "\(MeasureInfo.currencyToString(value, forceSimple: allowedNotation)) \(self.symbol)" }
+
     // When NOT dealing with feet OR NOT splitting, output as normal
     guard self.unit == UnitLength.feet && MeasureInfo.splitFeet else { return "\(MeasureInfo.numberToString(value, forceSimple: allowedNotation)) \(self.symbol)" }
 
@@ -158,7 +194,290 @@ func showItems(_ sfItems: [ScriptFilterItem]) {
   print(String(data: jsonData, encoding: .utf8)!)
 }
 
-let allMeasures: [MeasureInfo] = [
+// Currencies
+// Modelled as a Dimension so they go through the same matching, filtering, and
+// conversion code paths as the physical units. Rates are always fetched against
+// the US Dollar, which is also this dimension’s base unit.
+final class UnitCurrency: Dimension, @unchecked Sendable {
+  static let usDollars = UnitCurrency(symbol: "USD", converter: UnitConverterLinear(coefficient: 1))
+
+  override class func baseUnit() -> UnitCurrency { usDollars }
+}
+
+struct ExchangeRates: Codable {
+  static let baseCode = "USD"
+  static let hourInSeconds: TimeInterval = 60 * 60
+  static let dayInSeconds: TimeInterval = 24 * hourInSeconds
+
+  let rates: [String: Double]  // Amount of each currency per one US Dollar
+  let updated: Date  // When the provider published these rates
+  let nextUpdate: Date  // When the provider expects to publish new ones
+  let provider: String
+
+  var isStale: Bool { Date() >= self.nextUpdate }
+}
+
+// Sources of exchange rates
+// Both are free, need no API key, and publish once a day, which is plenty for
+// everyday conversions. The second is only consulted if the first is unreachable.
+struct RateProvider {
+  typealias Parsed = (rates: [String: Double], updated: Date, nextUpdate: Date)
+
+  let name: String
+  let url: URL
+  let parse: ([String: Any]) -> Parsed?
+
+  func fetch(timeout: TimeInterval) -> ExchangeRates? {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = timeout
+    configuration.timeoutIntervalForResource = timeout
+    configuration.waitsForConnectivity = false
+
+    var payload: Data?
+    let semaphore = DispatchSemaphore(value: 0)
+
+    let task = URLSession(configuration: configuration).dataTask(with: self.url) { data, response, _ in
+      if (response as? HTTPURLResponse)?.statusCode == 200 { payload = data }
+      semaphore.signal()
+    }
+
+    task.resume()
+
+    guard semaphore.wait(timeout: .now() + timeout + 1) == .success else {
+      task.cancel()
+      return nil
+    }
+
+    guard
+      let payload = payload,
+      let json = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any],
+      let parsed = self.parse(json),
+      parsed.rates[ExchangeRates.baseCode] != nil  // Sanity check the base is present
+    else { return nil }
+
+    return ExchangeRates(
+      rates: parsed.rates,
+      updated: parsed.updated,
+      nextUpdate: parsed.nextUpdate,
+      provider: self.name
+    )
+  }
+}
+
+let rateProviders: [RateProvider] = [
+  RateProvider(
+    name: "exchangerate-api.com",
+    url: URL(string: "https://open.er-api.com/v6/latest/\(ExchangeRates.baseCode)")!,
+    parse: { json in
+      guard
+        json["result"] as? String == "success",
+        json["base_code"] as? String == ExchangeRates.baseCode,
+        let rawRates = json["rates"] as? [String: Any],
+        let updated = json["time_last_update_unix"] as? Double
+      else { return nil }
+
+      let updatedDate = Date(timeIntervalSince1970: updated)
+      let nextUpdate = (json["time_next_update_unix"] as? Double).map { Date(timeIntervalSince1970: $0) }
+
+      return (
+        rates: rawRates.compactMapValues { ($0 as? NSNumber)?.doubleValue },
+        updated: updatedDate,
+        nextUpdate: nextUpdate ?? updatedDate.addingTimeInterval(ExchangeRates.dayInSeconds)
+      )
+    }
+  ),
+
+  RateProvider(
+    name: "currency-api",
+    url: URL(string: "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/\(ExchangeRates.baseCode.lowercased()).json")!,
+    parse: { json in
+      let dayFormatter = DateFormatter()
+      dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+      dayFormatter.timeZone = TimeZone(identifier: "UTC")
+      dayFormatter.dateFormat = "yyyy-MM-dd"
+
+      guard
+        let day = json["date"] as? String,
+        let updated = dayFormatter.date(from: day),
+        let rawRates = json[ExchangeRates.baseCode.lowercased()] as? [String: Any]
+      else { return nil }
+
+      let rates = rawRates.compactMap { code, value -> (String, Double)? in
+        guard let number = (value as? NSNumber)?.doubleValue else { return nil }
+        return (code.uppercased(), number)
+      }
+
+      return (
+        rates: Dictionary(rates, uniquingKeysWith: { first, _ in first }),
+        updated: updated,
+        nextUpdate: updated.addingTimeInterval(ExchangeRates.dayInSeconds)
+      )
+    }
+  )
+]
+
+// Rate caching
+// Rates are kept in the Workflow’s cache directory and reused until the provider
+// publishes new ones. A stale cache is still served right away, with the refresh
+// happening in a detached process so typing never waits on the network.
+enum ExchangeRateStore {
+  static let refreshArgument = "--refresh-rates"
+
+  private static let syncTimeout: TimeInterval = 5
+  private static let backgroundTimeout: TimeInterval = 20
+  private static let retryInterval: TimeInterval = 300  // Do not hammer a provider which is down
+
+  private static let cacheDirectory: URL = {
+    let environment = ProcessInfo.processInfo.environment
+
+    if let alfredCache = environment["alfred_workflow_cache"], !alfredCache.isEmpty {
+      return URL(fileURLWithPath: alfredCache, isDirectory: true)
+    }
+
+    return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+      .appendingPathComponent(environment["alfred_workflow_bundleid"] ?? "com.alfredapp.vitor.unitconverter", isDirectory: true)
+  }()
+
+  private static let ratesFile = cacheDirectory.appendingPathComponent("exchange-rates.json")
+  private static let attemptFile = cacheDirectory.appendingPathComponent("exchange-rates-attempt")
+
+  // Nil only when there are no rates at all, i.e. the first run happened offline
+  static func rates() -> ExchangeRates? {
+    guard let cached = read() else {
+      guard !attemptedRecently() else { return nil }
+
+      markAttempt()
+      guard let fetched = fetch(timeout: syncTimeout) else { return nil }
+
+      write(fetched)
+      return fetched
+    }
+
+    if cached.isStale && !attemptedRecently() {
+      markAttempt()
+      refreshInBackground()
+    }
+
+    return cached
+  }
+
+  static func refresh() {
+    guard let fetched = fetch(timeout: backgroundTimeout) else { return }
+    write(fetched)
+  }
+
+  private static func fetch(timeout: TimeInterval) -> ExchangeRates? {
+    for provider in rateProviders {
+      if let fetched = provider.fetch(timeout: timeout) { return fetched }
+    }
+
+    return nil
+  }
+
+  private static func read() -> ExchangeRates? {
+    guard let data = try? Data(contentsOf: ratesFile) else { return nil }
+
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .secondsSince1970
+
+    return try? decoder.decode(ExchangeRates.self, from: data)
+  }
+
+  private static func write(_ fetched: ExchangeRates) {
+    // Never trust a provider to hand us a next update time in the past
+    let stored = ExchangeRates(
+      rates: fetched.rates,
+      updated: fetched.updated,
+      nextUpdate: max(fetched.nextUpdate, Date().addingTimeInterval(ExchangeRates.hourInSeconds)),
+      provider: fetched.provider
+    )
+
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .secondsSince1970
+
+    guard let data = try? encoder.encode(stored) else { return }
+
+    try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+    try? data.write(to: ratesFile, options: .atomic)
+  }
+
+  private static func markAttempt() {
+    try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+
+    if FileManager.default.fileExists(atPath: attemptFile.path) {
+      try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: attemptFile.path)
+    } else {
+      FileManager.default.createFile(atPath: attemptFile.path, contents: nil)
+    }
+  }
+
+  private static func attemptedRecently() -> Bool {
+    guard
+      let attributes = try? FileManager.default.attributesOfItem(atPath: attemptFile.path),
+      let modified = attributes[.modificationDate] as? Date
+    else { return false }
+
+    return Date().timeIntervalSince(modified) < retryInterval
+  }
+
+  private static func refreshInBackground() {
+    guard let executable = Bundle.main.executableURL else { return }
+
+    let process = Process()
+    process.executableURL = executable
+    process.arguments = [refreshArgument]
+
+    // Alfred reads this process’ output, so the child must not inherit the pipe
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+
+    try? process.run()
+  }
+}
+
+// Aliases in addition to each currency’s localized name. Deliberately conservative:
+// “pounds” is not an alias for GBP, as it already means the unit of mass.
+let currencyAliases: [String: [String]] = [
+  "USD": ["dollars", "$"],
+  "EUR": ["euros", "€"],
+  "GBP": ["£"],
+  "INR": ["rupees", "rs", "₹"],
+  "JPY": ["yen", "¥"],
+  "CNY": ["yuan", "renminbi"],
+  "KRW": ["won", "₩"],
+  "RUB": ["rubles", "₽"]
+]
+
+// Names come from the system, so they follow the user’s language
+func currencyName(for code: String) -> String? {
+  guard code.count == 3 else { return nil }
+  return Locale.current.localizedString(forCurrencyCode: code.uppercased())
+}
+
+// Only codes the system recognises become measures, which also discards the
+// cryptocurrencies some providers mix into their rates
+func currencyMeasures(from exchangeRates: ExchangeRates?) -> [MeasureInfo] {
+  guard let exchangeRates = exchangeRates else { return [] }
+
+  return exchangeRates.rates.compactMap { code, rate -> MeasureInfo? in
+    guard rate > 0, let name = currencyName(for: code) else { return nil }
+
+    let unit =
+      code == ExchangeRates.baseCode
+      ? UnitCurrency.usDollars
+      : UnitCurrency(symbol: code, converter: UnitConverterLinear(coefficient: 1 / rate))
+
+    return MeasureInfo(names: [name] + (currencyAliases[code] ?? []), unit: unit, caseInsensitive: true)
+  }.sorted { $0.symbol < $1.symbol }
+}
+
+func looksLikeCurrency(_ searchString: String) -> Bool {
+  guard let firstWord = searchString.split(separator: " ").first else { return false }
+  return currencyName(for: String(firstWord)) != nil
+}
+
+let unitMeasures: [MeasureInfo] = [
   // Not Included:
   // * UnitAcceleration, as it only has two methods and the symbols of gravity and grams clash:
   //   https://developer.apple.com/documentation/foundation/unitacceleration
@@ -412,6 +731,16 @@ let allMeasures: [MeasureInfo] = [
   MeasureInfo(names: ["metric cups"], unit: UnitVolume.metricCups)
 ]
 
+// Refresh the exchange rates when spawned in the background by a previous run
+if CommandLine.arguments.dropFirst().first == ExchangeRateStore.refreshArgument {
+  ExchangeRateStore.refresh()
+  exit(EXIT_SUCCESS)
+}
+
+// Currencies come after the physical units, so those win any symbol clash
+let exchangeRates = ExchangeRateStore.rates()
+let allMeasures: [MeasureInfo] = unitMeasures + currencyMeasures(from: exchangeRates)
+
 // Parse input
 let rawInput = CommandLine.arguments[1].trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -458,7 +787,7 @@ guard rawOperation.count > 0 else {
     return ScriptFilterItem(
       uid: measure.symbol,
       title: measure.formatted(value: startNumber),
-      subtitle: measure.names[0].capitalized,
+      subtitle: measure.displayName,
       autocomplete: "\(measure.formatted(value: startNumber, forceSimple: true)) to ",
       arg: nil,
       valid: false
@@ -471,11 +800,14 @@ guard rawOperation.count > 0 else {
 
 // When no starting measures match, ask for corrections
 guard startMeasures.count > 0 else {
+  // Currencies are missing entirely when the rates could not be fetched
+  let missingRates = exchangeRates == nil && looksLikeCurrency(rawOperation)
+
   showItems([
     ScriptFilterItem(
-      uid: "Invalid Unit",
-      title: "Input a Valid Unit",
-      subtitle: "Examples: km, kilometers",
+      uid: missingRates ? "No Exchange Rates" : "Invalid Unit",
+      title: missingRates ? "Could Not Fetch Exchange Rates" : "Input a Valid Unit",
+      subtitle: missingRates ? "Check your internet connection and try again" : "Examples: km, kilometers",
       autocomplete: nil,
       arg: nil,
       valid: false
@@ -493,7 +825,7 @@ guard startMeasures.count < 2 else {
     return ScriptFilterItem(
       uid: measure.symbol,
       title: measure.formatted(value: startNumber),
-      subtitle: measure.names[0].capitalized,
+      subtitle: measure.displayName,
       autocomplete: "\(measure.formatted(value: startNumber, forceSimple: true)) to ",
       arg: nil,
       valid: false
@@ -530,6 +862,17 @@ let endMeasures = {
 let startDimension = Measurement(value: startNumber, unit: exactStartMeasure.unit)
 let formattedStartDimension = MeasureInfo(names: [], unit: startDimension.unit).formatted(value: startDimension.value, forceSimple: true)
 
+// Currency conversions are only as fresh as the last fetched rates
+let rateDate: String = {
+  guard exactStartMeasure.unit is UnitCurrency, let updated = exchangeRates?.updated else { return "" }
+
+  let formatter: DateFormatter = DateFormatter()
+  formatter.dateStyle = .medium
+  formatter.timeStyle = .none
+
+  return " · Rate from \(formatter.string(from: updated))"
+}()
+
 let sfItems: [ScriptFilterItem] = endMeasures.map { measure in
   let converted = startDimension.converted(to: measure.unit)
   let formatted = measure.formatted(value: converted.value)
@@ -537,7 +880,7 @@ let sfItems: [ScriptFilterItem] = endMeasures.map { measure in
   return ScriptFilterItem(
     uid: "\(exactStartMeasure.symbol) to \(measure.unit.symbol)",
     title: formatted,
-    subtitle: "\(exactStartMeasure.names[0].capitalized) → \(measure.names[0].capitalized)",
+    subtitle: "\(exactStartMeasure.displayName) → \(measure.displayName)\(rateDate)",
     autocomplete: "\(formattedStartDimension) to \(measure.symbol)",
     arg: formatted,
     valid: true

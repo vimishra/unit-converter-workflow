@@ -136,7 +136,7 @@
 	<key>createdby</key>
 	<string>Vítor Galvão</string>
 	<key>description</key>
-	<string>Convert between different units of measurement</string>
+	<string>Convert between different units of measurement and currencies</string>
 	<key>disabled</key>
 	<false/>
 	<key>name</key>
@@ -208,7 +208,7 @@
 				<key>queuemode</key>
 				<integer>1</integer>
 				<key>runningsubtext</key>
-				<string>Input a value and unit (example: 42 km)</string>
+				<string>Input a value and unit (example: 42 km or 100 USD)</string>
 				<key>script</key>
 				<string></string>
 				<key>scriptargtype</key>
@@ -398,8 +398,18 @@ Type further to filter for target units. Connector words (“to”, “as”, �
 
 ![Filtering for ending unit](images/about/kbtom.png)
 
+Currencies work the same way, matched by ISO code (in any case) or by name:
+
+* `100 usd to inr`
+* `100 GBP to INR`
+* `100 INR to USD`
+
+Note that `pounds` remains the unit of mass. Use `gbp` or `£` for the currency.
+
 * &lt;kbd&gt;↩&lt;/kbd&gt; Copy result to clipboard.
 * &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Paste result to frontmost app.
+
+Exchange rates are fetched once a day and cached, so currency conversions are accurate to within a day. They keep working offline with the last fetched rates, and the subtitle of every currency result says when those were published.
 
 Rounding precision and output notation can be set in the [Workflow’s Configuration](https://www.alfredapp.com/help/workflows/user-configuration/). Output format follows the Number Style in System Settings → General → Language &amp; Region.
 
@@ -598,7 +608,7 @@ Configure the [Hotkey](https://www.alfredapp.com/help/workflows/triggers/hotkey/
 		</dict>
 	</array>
 	<key>version</key>
-	<string>2025.1</string>
+	<string>2025.2</string>
 	<key>webaddress</key>
 	<string>https://github.com/alfredapp/unit-converter-workflow/</string>
 </dict>

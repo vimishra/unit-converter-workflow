@@ -1,6 +1,6 @@
 # <img src='Workflow/icon.png' width='45' align='center' alt='icon'> Unit Converter Alfred Workflow
 
-Convert between different units of measurement
+Convert between different units of measurement and currencies
 
 [⤓ Install on the Alfred Gallery](https://alfred.app/workflows/alfredapp/unit-converter)
 
@@ -22,11 +22,39 @@ Type further to filter for target units. Connector words (“to”, “as”, �
 
 ![Filtering for ending unit](Workflow/images/about/kbtom.png)
 
+### Currencies
+
+Currencies work the same way, matched by ISO code (in any case) or by name.
+
+```
+100 usd to inr
+100 GBP to INR
+100 INR to USD
+```
+
+Common symbols and nicknames are recognised too, such as `$`, `€`, `£`, `₹`, `rupees`, `euros`, and `yen`. Note that `pounds` remains the unit of mass — use `gbp` or `£` for the currency, and `cup` remains the unit of volume — use the uppercase `CUP` for the Cuban Peso.
+
+Exchange rates come from [ExchangeRate-API](https://www.exchangerate-api.com/docs/free), falling back to [Currency API](https://github.com/fawazahmed0/exchange-api). Both are free and need no API key. Rates are published once a day and cached in the Workflow’s cache directory, so conversions are accurate to within a day and cost no network time after the first fetch of the day. Refreshes happen in the background: a stale cache is used immediately, so typing never waits on the network. Conversions keep working offline with the last fetched rates, and the subtitle of every currency result says when those rates were published.
+
 * <kbd>↩&#xFE0E;</kbd> Copy result to clipboard.
 * <kbd>⌘</kbd><kbd>↩&#xFE0E;</kbd> Paste result to frontmost app.
 
-Rounding precision and output notation can be set in the [Workflow’s Configuration](https://www.alfredapp.com/help/workflows/user-configuration/). Output format follows the Number Style in System Settings → General → Language & Region.
+Currency amounts are rounded to two decimal places, or to the configured precision when that is lower. Rounding precision and output notation can be set in the [Workflow’s Configuration](https://www.alfredapp.com/help/workflows/user-configuration/). Output format follows the Number Style in System Settings → General → Language & Region.
 
 Configure the [Hotkey](https://www.alfredapp.com/help/workflows/triggers/hotkey/) or use the [Universal Action](https://www.alfredapp.com/help/features/universal-actions/) as shortcuts to convert results from Alfred’s [Calculator](https://www.alfredapp.com/help/features/calculator/), [Clipboard History](https://www.alfredapp.com/help/features/clipboard/), or selected text.
 
 ![Universal Action](Workflow/images/about/ua.png)
+
+## Building
+
+The Script Filter runs the universal binary at `Workflow/converter`, built from `Resources/converter.swift`:
+
+```
+./Resources/build.sh
+```
+
+The build ad-hoc signs the binary, as `lipo` leaves the merged result unsigned and Apple Silicon refuses to run unsigned code. It is not notarized, so a `.alfredworkflow` downloaded through a browser arrives quarantined and macOS may refuse to run the converter. Either build on the machine that will use it, or clear the flag after installing:
+
+```
+xattr -dr com.apple.quarantine ~/Library/Application\ Support/Alfred/Alfred.alfredpreferences/workflows
+```
