@@ -323,7 +323,6 @@ let rateProviders: [RateProvider] = [
 enum ExchangeRateStore {
   static let refreshArgument = "--refresh-rates"
 
-  private static let syncTimeout: TimeInterval = 5
   private static let backgroundTimeout: TimeInterval = 20
   private static let retryInterval: TimeInterval = 300  // Do not hammer a provider which is down
 
@@ -341,19 +340,14 @@ enum ExchangeRateStore {
   private static let ratesFile = cacheDirectory.appendingPathComponent("exchange-rates.json")
   private static let attemptFile = cacheDirectory.appendingPathComponent("exchange-rates-attempt")
 
-  // Nil only when there are no rates at all, i.e. the first run happened offline
+  // Never blocks. A missing or stale cache is refreshed in a detached process and
+  // picked up by a later run, so a slow or blocked network cannot stall the Script
+  // Filter — least of all for the unit conversions, which need no network at all.
   static func rates() -> ExchangeRates? {
-    guard let cached = read() else {
-      guard !attemptedRecently() else { return nil }
+    let cached = read()
+    let needsRefresh = cached.map { $0.isStale } ?? true
 
-      markAttempt()
-      guard let fetched = fetch(timeout: syncTimeout) else { return nil }
-
-      write(fetched)
-      return fetched
-    }
-
-    if cached.isStale && !attemptedRecently() {
+    if needsRefresh && !attemptedRecently() {
       markAttempt()
       refreshInBackground()
     }
@@ -688,7 +682,7 @@ let unitMeasures: [MeasureInfo] = [
 
   // Speed
   MeasureInfo(names: ["meters per second"], unit: UnitSpeed.metersPerSecond),
-  MeasureInfo(names: ["kilometers per hour"], unit: UnitSpeed.kilometersPerHour),
+  MeasureInfo(names: ["kilometers per hour", "kmph", "kph", "kmh"], unit: UnitSpeed.kilometersPerHour),
   MeasureInfo(names: ["miles per hour"], unit: UnitSpeed.milesPerHour),
   MeasureInfo(names: ["knots"], unit: UnitSpeed.knots),
 
@@ -806,8 +800,8 @@ guard startMeasures.count > 0 else {
   showItems([
     ScriptFilterItem(
       uid: missingRates ? "No Exchange Rates" : "Invalid Unit",
-      title: missingRates ? "Could Not Fetch Exchange Rates" : "Input a Valid Unit",
-      subtitle: missingRates ? "Check your internet connection and try again" : "Examples: km, kilometers",
+      title: missingRates ? "Exchange Rates Unavailable" : "Input a Valid Unit",
+      subtitle: missingRates ? "Fetching in the background · Try again in a moment" : "Examples: km, kilometers",
       autocomplete: nil,
       arg: nil,
       valid: false
